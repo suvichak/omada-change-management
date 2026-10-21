@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Point the public Cloudflare A record omadawrite.example.com at the CT's
+# private IP (same pattern as pve3, grafana, ai-downloader).
+#
+#   omadawrite-dns            show the current record
+#   omadawrite-dns apply [ip] create/update it (default 192.168.0.215)
+#
+# The token is read from /etc/pve/priv/cloudflare.env and handed to curl on
+# stdin (-K -), so it never shows up in argv / ps.
+set -euo pipefail
+
+NAME=omadawrite.example.com
+ZONE=example.com
+IP=${2:-192.168.0.215}
+STORE=/etc/pve/priv/cloudflare.env
+API=https://api.cloudflare.com/client/v4
+
+die() { echo "omadawrite-dns: $*" >&2; exit 1; }
+[[ -s $STORE ]] || die "no Cloudflare token at $STORE"
+TOK=$(sed -n 's/^[[:space:]]*CF_Token[[:space:]]*=[[:space:]]*//p' "$STORE" | head -1)
+[[ -n $TOK ]] || die "$STORE has no CF_Token= line"
+
+cf() { curl -fsS -K - "$@" <<<"header = \"Authorization: Bearer $TOK\""; }
+json() { python3 -c "import sys, json; d = json.load(sys.stdin); $1"; }
+
+ZID=$(cf "$API/zones?name=$ZONE" | json 'print(d["result"][0]["id"])')
+REC=$(cf "$API/zones/$ZID/dns_records?name=$NAME")
+echo "$REC" | json 'print("\n".join("current: {type} {name} -> {content} (proxied={proxied})".format(**r) for r in d["result"]) or "current: no record")'
+
+[[ ${1:-show} == apply ]] || exit 0
+
+# A CNAME/AAAA with the same name would block an A record — refuse rather than guess.
+echo "$REC" | json 'sys.exit(1 if any(r["type"] != "A" for r in d["result"]) else 0)' ||
+    die "a non-A record exists for $NAME — remove it in Cloudflare first"
+
+RID=$(echo "$REC" | json 'print(d["result"][0]["id"] if d["result"] else "")')
+BODY=$(printf '{"type":"A","name":"%s","content":"%s","ttl":300,"proxied":false}' "$NAME" "$IP")
+if [[ -n $RID ]]; then
+    cf -X PUT "$API/zones/$ZID/dns_records/$RID" -H 'Content-Type: application/json' --data "$BODY" >/dev/null
+else
+    cf -X POST "$API/zones/$ZID/dns_records" -H 'Content-Type: application/json' --data "$BODY" >/dev/null
+fi
+echo "set: A $NAME -> $IP"

@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Issue/renew the TLS cert for omadawrite.example.com and push it into
+# CT 126. Same design as ai-downloader-cert on pve2, but installed on
+# pve1 because `pct push` is node-local.
+#
+# The Cloudflare token lives ONLY in /etc/pve/priv (root-only, replicated by
+# pmxcfs) and is written out solely as a 0600 file under /run — tmpfs, so it
+# never touches a disk and never appears in a container backup.  The container
+# receives the certificate and its key, and nothing else: it has no way to
+# touch DNS.
+set -euo pipefail
+
+DOMAIN=omadawrite.example.com
+CTID=${OMADAWRITE_CTID:-126}
+STORE=/etc/pve/priv/cloudflare.env          # CF_Token=...
+RUNDIR=/run/omadawrite-cert
+INI="$RUNDIR/cf.ini"
+CTCERTDIR=/etc/nginx/certs
+LIVE=/etc/letsencrypt/live/$DOMAIN
+
+die() { echo "omadawrite-cert: $*" >&2; exit 1; }
+
+cleanup() { rm -f "$INI"; rmdir "$RUNDIR" 2>/dev/null || true; }
+trap cleanup EXIT
+
+write_ini() {
+    [[ -s $STORE ]] || die "no Cloudflare token at $STORE"
+    local tok
+    tok=$(sed -n 's/^[[:space:]]*CF_Token[[:space:]]*=[[:space:]]*//p' "$STORE" | head -1)
+    [[ -n $tok ]] || die "$STORE has no CF_Token= line"
+    install -d -m 0700 "$RUNDIR"
+    ( umask 077; printf 'dns_cloudflare_api_token = %s\n' "$tok" > "$INI" )
+}
+
+issue() {
+    command -v certbot >/dev/null ||
+        die "certbot missing: apt-get install -y certbot python3-certbot-dns-cloudflare"
+    write_ini
+    # certonly is a no-op when the cert is not yet due, so this is safe daily
+    certbot certonly \
+        --non-interactive --agree-tos --register-unsafely-without-email \
+        --key-type ecdsa \
+        --dns-cloudflare \
+        --dns-cloudflare-credentials "$INI" \
+        --dns-cloudflare-propagation-seconds 30 \
+        --cert-name "$DOMAIN" -d "$DOMAIN" \
+        "$@"
+}
+
+push() {
+    [[ -s $LIVE/fullchain.pem ]] || die "no certificate at $LIVE"
+    [[ $(pct status "$CTID") == "status: running" ]] || die "CT $CTID is not running"
+
+    local local_fp remote_fp
+    local_fp=$(openssl x509 -in "$LIVE/fullchain.pem" -noout -fingerprint -sha256)
+    remote_fp=$(pct exec "$CTID" -- sh -c \
+        "openssl x509 -in $CTCERTDIR/fullchain.pem -noout -fingerprint -sha256 2>/dev/null" \
+        2>/dev/null || true)
+
+    if [[ $local_fp == "$remote_fp" ]]; then
+        echo "CT $CTID already has this certificate — nothing to do"
+        return 0
+    fi
+
+    pct exec "$CTID" -- install -d -m 0755 "$CTCERTDIR"
+    pct push "$CTID" "$LIVE/fullchain.pem" "$CTCERTDIR/fullchain.pem" --perms 0644
+    pct push "$CTID" "$LIVE/privkey.pem"   "$CTCERTDIR/privkey.pem"   --perms 0600
+    pct exec "$CTID" -- sh -c \
+        'nginx -t && systemctl reload nginx || systemctl restart nginx'
+    echo "pushed to CT $CTID and reloaded nginx"
+}
+
+case "${1:-deploy}" in
+deploy)  issue; push ;;
+renew)   issue; push ;;          # certonly self-limits; same path, run daily
+force)   issue --force-renewal; push ;;
+push)    push ;;
+status)
+    if [[ -s $LIVE/fullchain.pem ]]; then
+        openssl x509 -in "$LIVE/fullchain.pem" -noout -subject -enddate -issuer
+    else
+        echo "host : no certificate issued yet"
+    fi
+    pct exec "$CTID" -- sh -c \
+        "openssl x509 -in $CTCERTDIR/fullchain.pem -noout -enddate 2>/dev/null \
+         || echo 'CT $CTID: no certificate'"
+    ;;
+*) echo "usage: omadawrite-cert {deploy|renew|force|push|status}" >&2; exit 2 ;;
+esac

@@ -1,0 +1,9 @@
+__pycache__/
+.pytest_cache/
+*.db
+*.pcap
+captures/
+# TP-Link's OpenAPI spec, downloaded by tools/omada-apidoc fetch
+docs/omada-openapi-*.json
+# Blog posts are published elsewhere, never from this repo
+docs/blog/

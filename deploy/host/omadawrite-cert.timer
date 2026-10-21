@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily omadawrite cert renewal check
+
+[Timer]
+OnCalendar=*-*-* 03:50:00
+RandomizedDelaySec=45min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

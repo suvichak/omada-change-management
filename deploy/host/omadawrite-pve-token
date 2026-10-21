@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# (Re)create the Proxmox API token omadawrite uses, and write it straight into
+# the CT's env file. The secret goes host → /run (tmpfs) → pct push; it never
+# lands on a disk outside the CT and never passes through a workstation.
+#
+# Privileges: VM.Audit, VM.Snapshot, VM.Snapshot.Rollback, VM.PowerMgmt on
+# /vms/213 only, plus read-only PVEAuditor on the node for task status.
+# Re-running rotates the token.
+set -euo pipefail
+
+CTID=${CTID:-126}
+VMID=${VMID:-213}
+NODE=${NODE:-pve1}
+PVEUSER=omadawrite@pve
+TOKENID=ct$CTID
+ROLE=OmadaWriteSnapshot
+PRIVS=VM.Audit,VM.Snapshot,VM.Snapshot.Rollback,VM.PowerMgmt
+
+die() { echo "omadawrite-pve-token: $*" >&2; exit 1; }
+[[ $(hostname) == "$NODE" ]] || die "run on $NODE (pct is node-local)"
+pct status "$CTID" | grep -q running || die "CT $CTID is not running"
+
+if pveum role list --output-format json | grep -q "\"roleid\":\"$ROLE\""; then
+    pveum role modify "$ROLE" --privs "$PRIVS"
+else
+    pveum role add "$ROLE" --privs "$PRIVS"
+fi
+pveum user list --output-format json | grep -q "\"userid\":\"$PVEUSER\"" ||
+    pveum user add "$PVEUSER" --comment "omadawrite CT $CTID: snapshot/rollback VM $VMID only"
+
+pveum user token remove "$PVEUSER" "$TOKENID" 2>/dev/null || true
+SECRET=$(pveum user token add "$PVEUSER" "$TOKENID" --privsep 1 \
+    --comment "omadawrite CT $CTID" --output-format json |
+    python3 -c 'import sys, json; print(json.load(sys.stdin)["value"])')
+
+# privsep token: effective rights = user ACL ∩ token ACL, so both get them
+for who in "--users $PVEUSER" "--tokens $PVEUSER!$TOKENID"; do
+    # shellcheck disable=SC2086
+    pveum acl modify "/vms/$VMID" $who --roles "$ROLE"
+    # shellcheck disable=SC2086
+    pveum acl modify "/nodes/$NODE" $who --roles PVEAuditor
+done
+
+umask 077
+RUN=$(mktemp -d -p /run omadawrite-token.XXXXXX)
+trap 'rm -rf "$RUN"' EXIT
+pct exec "$CTID" -- cat /etc/omadawrite/env > "$RUN/env.old"
+grep -v '^PVE_TOKEN=' "$RUN/env.old" > "$RUN/env" || true
+printf 'PVE_TOKEN=%s!%s=%s\n' "$PVEUSER" "$TOKENID" "$SECRET" >> "$RUN/env"
+pct push "$CTID" "$RUN/env" /etc/omadawrite/env --perms 0600
+pct exec "$CTID" -- systemctl restart omadawrite-web omadawrite-watchdog
+
+echo "token $PVEUSER!$TOKENID written to CT $CTID and services restarted"

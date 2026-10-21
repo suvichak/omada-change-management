@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>omadawrite · sign in</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login">
+  <main class="card narrow">
+    <h1>omadawrite</h1>
+    <p class="muted">Sign in with an Omada controller admin account. The password is kept only
+      in an encrypted cookie on this browser for 30 days and is used to run the changes you approve.</p>
+    <form id="f">
+      <label>Omada username <input name="username" autocomplete="username" required></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit" class="primary">Sign in</button>
+      <p id="err" class="err"></p>
+    </form>
+  </main>
+  <script src="/static/login.js"></script>
+</body>
+</html>

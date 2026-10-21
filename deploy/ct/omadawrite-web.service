@@ -1,0 +1,21 @@
+[Unit]
+Description=omadawrite web UI + AI intake API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=omadawrite
+Group=omadawrite
+EnvironmentFile=/etc/omadawrite/env
+WorkingDirectory=/opt/omadawrite
+ExecStart=/usr/bin/python3 -m uvicorn --factory omadawrite.web:create_app --host 127.0.0.1 --port 8080 --no-server-header
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/omadawrite
+
+[Install]
+WantedBy=multi-user.target

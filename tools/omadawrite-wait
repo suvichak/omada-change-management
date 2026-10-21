@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Wait for an omadawrite proposal to reach a point where the AI can continue.
+
+  omadawrite-wait <id>                 wait until the proposal is closed (any final status)
+  omadawrite-wait <id> --until-applied wait only until it is applied (watching) or closed
+  omadawrite-wait <id> --until-settled wait until watching AND the 1-min settle is over:
+                                       the right moment to start tests
+  omadawrite-wait --free               wait until no proposal is open (the slot is free)
+
+Options: --interval SECONDS (default 15), --timeout MINUTES (default 240; 0 = no limit)
+
+Exit codes, so a script can branch:
+  0  completed                  change kept, continue with the next step
+  1  reverted / revert_failed / abandoned / failed   stop and tell the human
+  2  rejected_by_omada          Omada refused it and nothing changed: submit a corrected proposal
+  3  rejected / withdrawn       a person cleared it: don't continue without asking
+  4  watching                   (only with --until-applied / --until-settled) the change is live, test it now
+  5  timeout                    still pending: the human hasn't acted yet
+  6  error talking to the box
+
+The last line printed is JSON: {"id", "status", "error", "settle_until", "watch_until",
+"up_since", "down_since", "revert_at"}.
+
+Watchdog timeline (CT 126 defaults): 5 s stable internet before writing, settle 1 min,
+watch 5 min, close once also up 4 min in a row, revert after 5 min down.
+Machines use IPs: the box is reached at 192.168.0.215 with SNI
+omadawrite.example.com. The token comes from CT 126 via pve1
+(192.168.0.102), or from $OMADAWRITE_TOKEN. Override the addresses with
+OMADAWRITE_IP, OMADAWRITE_NAME, OMADAWRITE_PVE_IP and OMADAWRITE_CTID.
+"""
+import argparse
+import http.client
+import json
+import os
+import socket
+import ssl
+import subprocess
+import sys
+import time
+
+BOX_IP = os.environ.get("OMADAWRITE_IP", "192.168.0.215")
+BOX_NAME = os.environ.get("OMADAWRITE_NAME", "omadawrite.example.com")
+PVE_IP = os.environ.get("OMADAWRITE_PVE_IP", "192.168.0.102")
+CTID = os.environ.get("OMADAWRITE_CTID", "126")
+
+FINAL = {"completed": 0, "reverted": 1, "revert_failed": 1, "abandoned": 1, "failed": 1,
+         "rejected_by_omada": 2, "rejected": 3, "withdrawn": 3}
+
+
+def token() -> str:
+    t = os.environ.get("OMADAWRITE_TOKEN", "").strip()
+    if t:
+        return t
+    out = subprocess.run(
+        ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", f"root@{PVE_IP}",
+         f"pct exec {CTID} -- sed -n 's/^AI_TOKEN=//p' /etc/omadawrite/env"],
+        capture_output=True, text=True, timeout=30)
+    t = out.stdout.strip()
+    if not t:
+        raise SystemExit(f"no token: {out.stderr.strip()}")
+    return t
+
+
+class Conn(http.client.HTTPSConnection):
+    def connect(self):
+        sock = socket.create_connection((BOX_IP, 443), self.timeout)
+        self.sock = ssl.create_default_context().wrap_socket(sock, server_hostname=BOX_NAME)
+
+
+def get(path: str, tok: str) -> dict:
+    c = Conn(BOX_NAME, 443, timeout=15)
+    try:
+        c.request("GET", path, headers={"Authorization": f"Bearer {tok}", "Host": BOX_NAME})
+        r = c.getresponse()
+        body = r.read()
+        if r.status != 200:
+            raise RuntimeError(f"HTTP {r.status} {body[:200]!r}")
+        return json.loads(body)
+    finally:
+        c.close()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("id", nargs="?", type=int)
+    ap.add_argument("--free", action="store_true")
+    ap.add_argument("--until-applied", action="store_true")
+    ap.add_argument("--until-settled", action="store_true")
+    ap.add_argument("--interval", type=float, default=15)
+    ap.add_argument("--timeout", type=float, default=240)
+    a = ap.parse_args()
+    if not a.free and a.id is None:
+        ap.error("give a proposal id or --free")
+
+    tok = token()
+    deadline = time.time() + a.timeout * 60 if a.timeout else None
+    last, errors = None, 0
+    while True:
+        try:
+            if a.free:
+                cur = get("/api/proposals/current", tok)
+                if not cur.get("open"):
+                    print(json.dumps({"id": None, "status": "free"}))
+                    return 0
+                p = cur["open"]
+            else:
+                p = get(f"/api/proposals/{a.id}", tok)
+            errors = 0
+        except Exception as e:  # the box may restart briefly; give up after ~5 tries
+            errors += 1
+            print(f"{time.strftime('%H:%M:%S')} box unreachable ({e})", file=sys.stderr)
+            if errors >= 5:
+                print(json.dumps({"id": a.id, "status": "error", "error": str(e)}))
+                return 6
+            time.sleep(a.interval)
+            continue
+
+        st = p.get("status")
+        if st != last:
+            print(f"{time.strftime('%H:%M:%S')} #{p.get('id')} {st}", file=sys.stderr)
+            last = st
+        summary = {k: p.get(k) for k in ("id", "status", "error", "settle_until", "watch_until",
+                                         "up_since", "down_since", "revert_at")}
+        if not a.free:
+            if st in FINAL:
+                print(json.dumps(summary))
+                return FINAL[st]
+            if st == "watching" and (a.until_applied or (
+                    a.until_settled and time.time() >= (p.get("settle_until") or 0))):
+                print(json.dumps(summary))
+                return 4
+        if deadline and time.time() >= deadline:
+            print(json.dumps(summary | {"status": f"timeout ({st})"}))
+            return 5
+        time.sleep(a.interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

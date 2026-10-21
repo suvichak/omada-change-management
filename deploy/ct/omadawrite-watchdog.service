@@ -1,0 +1,23 @@
+[Unit]
+Description=omadawrite watchdog — internet check and controller VM auto-revert
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=omadawrite
+Group=omadawrite
+EnvironmentFile=/etc/omadawrite/env
+WorkingDirectory=/opt/omadawrite
+ExecStart=/usr/bin/python3 -m omadawrite.watchdog
+Restart=always
+RestartSec=5
+# The one process that must survive memory pressure
+OOMScoreAdjust=-500
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/omadawrite
+
+[Install]
+WantedBy=multi-user.target

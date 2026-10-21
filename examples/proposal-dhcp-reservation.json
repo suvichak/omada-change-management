@@ -1,0 +1,15 @@
+{
+  "title": "Reserve 192.168.70.9 for the printer",
+  "reason": "Printer keeps moving; scan-to-SMB breaks. Adds one DHCP reservation, changes nothing else. Spec: CreateDhcpReservationOpenApiVO. Risk: none beyond the one reservation.",
+  "submitted_by": "claude",
+  "commands": [
+    { "method": "GET", "path": "/sites/0123456789abcdef01234567/setting/service/dhcp",
+      "query": { "currentPage": 1, "currentPageSize": 1000 }, "note": "state before" },
+    { "method": "POST", "path": "/sites/0123456789abcdef01234567/setting/service/dhcp",
+      "body": { "netId": "<network id>", "clientMac": "AA-BB-CC-DD-EE-FF", "ip": "192.168.70.9",
+                "description": "printer", "status": true },
+      "note": "copy the exact body the Omada UI sends from the browser devtools" },
+    { "method": "GET", "path": "/sites/0123456789abcdef01234567/setting/service/dhcp",
+      "query": { "currentPage": 1, "currentPageSize": 1000 }, "note": "state after" }
+  ]
+}

@@ -1,0 +1,8 @@
+[Unit]
+Description=Renew omadawrite.example.com cert and push it into CT 126
+After=network-online.target pve-cluster.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/omadawrite-cert renew

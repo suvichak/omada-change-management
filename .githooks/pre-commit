@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Block a commit that adds a secret or a private identifier.
+# Enable once per clone:  git config core.hooksPath .githooks
+set -euo pipefail
+GL=$(command -v gitleaks || echo "$HOME/bin/gitleaks")
+[[ -x $GL ]] || { echo "pre-commit: gitleaks not found (PATH or ~/bin) — refusing to commit unscanned" >&2; exit 1; }
+"$GL" git --staged --no-banner --redact -v . || { echo "pre-commit: gitleaks found a secret" >&2; exit 1; }
+
+# Private patterns live OUTSIDE the repo, so the list itself is never published.
+PAT=${OCM_PRIVATE_PATTERNS:-$HOME/.config/omada-change-management/private-patterns}
+if [[ -s $PAT ]]; then
+    if git diff --cached -U0 --no-color | grep '^+' | grep -nEf <(grep -v '^\s*\(#\|$\)' "$PAT"); then
+        echo "pre-commit: staged lines match $PAT (shown above)" >&2; exit 1
+    fi
+else
+    echo "pre-commit: warning: no $PAT, private-identifier check skipped" >&2
+fi

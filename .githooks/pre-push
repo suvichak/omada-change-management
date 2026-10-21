@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# The public repo only ever gets main. Work branches go to the private remote.
+# Enable once per clone:  git config core.hooksPath .githooks
+set -euo pipefail
+remote=$1 url=$2
+public=${OCM_PUBLIC_URL_PATTERN:-suvichak/omada-change-management(\.git)?$}
+[[ $url =~ $public ]] || exit 0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [[ $local_sha =~ ^0+$ ]] && { echo "pre-push: no deleting refs on the public repo" >&2; exit 1; }
+    [[ $remote_ref == refs/heads/main ]] || {
+        echo "pre-push: only main may be pushed to the public repo ($remote_ref refused)" >&2; exit 1; }
+done
+
+GL=$(command -v gitleaks || echo "$HOME/bin/gitleaks")
+[[ -x $GL ]] || { echo "pre-push: gitleaks not found — refusing" >&2; exit 1; }
+"$GL" git --no-banner --redact . || { echo "pre-push: gitleaks found a secret in history" >&2; exit 1; }
+PAT=${OCM_PRIVATE_PATTERNS:-$HOME/.config/omada-change-management/private-patterns}
+if [[ -s $PAT ]] && git log -p main | grep -qEf <(grep -v '^\s*\(#\|$\)' "$PAT"); then
+    echo "pre-push: main's history matches $PAT — not pushing to the public repo" >&2; exit 1
+fi

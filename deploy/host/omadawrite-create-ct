@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Create CT 126 "omadawrite" and install the app into it.
+#
+# Runs on pve1 — the SAME node as the controller VM 213 — so the
+# rollback path (CT → PVE API → VM 213) stays on vmbr0 and never depends on
+# the gateway, a switch, DNS or the internet.
+#
+#   omadawrite-create-ct /root/omadawrite.tar.gz
+set -euo pipefail
+
+CTID=${CTID:-126}
+IP=${IP:-192.168.0.215}
+GW=192.168.0.1
+VLAN=1                       # same as VM 213 (net0 tag=1)
+STORAGE=${STORAGE:-local-zfs}
+SRC=${1:?usage: omadawrite-create-ct /path/to/omadawrite.tar.gz}
+
+die() { echo "omadawrite-create-ct: $*" >&2; exit 1; }
+
+[[ $(hostname) == pve1 ]] || die "run this on pve1 (same node as VM 213)"
+[[ -s $SRC ]] || die "no tarball at $SRC"
+pct status "$CTID" &>/dev/null && die "CT $CTID already exists"
+pvesh get /cluster/nextid --vmid "$CTID" &>/dev/null || die "VMID $CTID is taken somewhere in the cluster"
+grep -rqs "ip=$IP/" /etc/pve/nodes/*/lxc/ && die "$IP is already assigned to a CT in /etc/pve"
+ping -c2 -W1 "$IP" &>/dev/null && die "$IP answers ping — not free"
+
+TPL=$(pveam list local | awk '/debian-13-standard/ {print $1}' | sort -V | tail -1)
+if [[ -z $TPL ]]; then
+    pveam update >/dev/null
+    name=$(pveam available --section system | awk '/debian-13-standard/ {print $2}' | sort -V | tail -1)
+    [[ -n $name ]] || die "no debian-13-standard template available"
+    pveam download local "$name"
+    TPL="local:vztmpl/$name"
+fi
+
+pct create "$CTID" "$TPL" \
+    --hostname omadawrite \
+    --description "omadawrite.example.com — Omada change control (AI proposals, snapshot VM 213, auto-revert). See: Container $CTID (omadawrite.example.com)" \
+    --cores 1 --memory 512 --swap 256 \
+    --rootfs "$STORAGE:4" \
+    --net0 "name=eth0,bridge=vmbr0,tag=$VLAN,ip=$IP/24,gw=$GW,firewall=1" \
+    --nameserver "$GW" --searchdomain example.com \
+    --unprivileged 1 --features nesting=1 \
+    --onboot 1 --tags omada
+
+pct start "$CTID"
+for _ in $(seq 30); do pct exec "$CTID" -- true 2>/dev/null && break; sleep 1; done
+
+
+pct push "$CTID" "$SRC" /root/omadawrite.tar.gz
+pct exec "$CTID" -- bash -c 'rm -rf /root/omadawrite-src && mkdir -p /root/omadawrite-src &&
+    tar -xzf /root/omadawrite.tar.gz -C /root/omadawrite-src &&
+    bash /root/omadawrite-src/deploy/ct/install.sh'
+
+cat <<EOF
+
+CT $CTID created at $IP. Next, on this host:
+  omadawrite-pve-token      # Proxmox token for snapshot/rollback of VM 213 → CT env
+  omadawrite-dns apply      # Cloudflare A record → $IP
+  omadawrite-cert deploy    # Let's Encrypt cert → CT nginx
+  pct exec $CTID -- grep ^AI_TOKEN= /etc/omadawrite/env   # give this to the AI
+EOF

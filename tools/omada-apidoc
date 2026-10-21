@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Look things up in the Omada controller's own API spec (/v3/api-docs).
+
+  omada-apidoc fetch                      download the spec from the controller (by IP) into docs/
+  omada-apidoc tags                       list topics and how many operations each has
+  omada-apidoc search <words...>          find operations by path / summary / tag
+  omada-apidoc op <METHOD> <path>         parameters + request body with REQUIRED fields and enums
+  omada-apidoc schema <Name>              one schema, expanded two levels
+
+The spec documents the Open API (/openapi/v1|v2|v3/{omadacId}/...). omadawrite
+proposals currently call the internal API (/{omadacId}/api/v2/...), which is
+NOT in the spec — use the spec for field names, required fields and enum
+meanings, and check the internal shape with a live GET (see the note
+"Omada API documentation").
+"""
+import http.client
+import json
+import os
+import re
+import socket
+import ssl
+import sys
+from pathlib import Path
+
+DOCS = Path(__file__).resolve().parents[1] / "docs"
+CONTROLLER_IP = os.environ.get("OMADA_IP", "192.168.0.213")
+CONTROLLER_NAME = os.environ.get("OMADA_NAME", "omada.example.com")
+
+
+def spec_path() -> Path:
+    found = sorted(DOCS.glob("omada-openapi-*.json"))
+    if not found:
+        sys.exit("no spec in docs/ — run: omada-apidoc fetch")
+    return found[-1]
+
+
+def load() -> dict:
+    return json.loads(spec_path().read_text())
+
+
+def _get(path: str) -> bytes:
+    # Connect by IP; verify the certificate against the controller's name (SNI).
+    ctx = ssl.create_default_context()
+    raw = socket.create_connection((CONTROLLER_IP, 8043), timeout=30)
+    conn = http.client.HTTPSConnection(CONTROLLER_NAME, 8043, context=ctx, timeout=30)
+    conn.sock = ctx.wrap_socket(raw, server_hostname=CONTROLLER_NAME)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    if resp.status != 200:
+        sys.exit(f"GET {path}: HTTP {resp.status}")
+    return resp.read()
+
+
+def fetch() -> None:
+    ver = json.loads(_get("/api/info"))["result"]["controllerVer"]
+    body = json.loads(_get("/v3/api-docs"))
+    DOCS.mkdir(exist_ok=True)
+    out = DOCS / f"omada-openapi-{ver}.json"
+    out.write_text(json.dumps(body, indent=1))
+    print(f"saved {out} ({out.stat().st_size // 1024} KB, controller {ver}, {len(body['paths'])} paths)")
+
+
+def ref_name(node: dict):
+    r = node.get("$ref") or (node.get("items") or {}).get("$ref")
+    return r.split("/")[-1] if r else None
+
+
+def describe(prop: dict) -> str:
+    t = prop.get("type") or ("object" if prop.get("$ref") else "")
+    if t == "array":
+        inner = ref_name(prop) or (prop.get("items") or {}).get("type", "")
+        t = f"array<{inner}>"
+    elif ref_name(prop):
+        t = ref_name(prop)
+    extra = []
+    if "enum" in prop:
+        extra.append(f"enum {prop['enum']}")
+    for k in ("minimum", "maximum", "minLength", "maxLength", "pattern", "format"):
+        if k in prop:
+            extra.append(f"{k}={prop[k]}")
+    desc = re.sub(r"\s+", " ", prop.get("description") or "").strip()
+    return f"{t}{' (' + ', '.join(extra) + ')' if extra else ''}  {desc}"
+
+
+def show_schema(spec: dict, name: str, depth: int = 0, max_depth: int = 2, seen=None) -> None:
+    seen = seen or set()
+    s = spec["components"]["schemas"].get(name)
+    if s is None:
+        print("  " * depth + f"(unknown schema {name})")
+        return
+    required = set(s.get("required") or [])
+    print("  " * depth + f"{name}" + (f"  — required: {sorted(required)}" if required else ""))
+    if name in seen:
+        return
+    seen.add(name)
+    for key, prop in (s.get("properties") or {}).items():
+        mark = "*" if key in required else " "
+        print("  " * depth + f"  {mark} {key}: {describe(prop)}")
+        child = ref_name(prop)
+        if child and depth < max_depth:
+            show_schema(spec, child, depth + 2, max_depth, seen)
+
+
+def operations(spec: dict):
+    for path, ops in spec["paths"].items():
+        for method, op in ops.items():
+            if isinstance(op, dict) and method in ("get", "post", "put", "patch", "delete"):
+                yield method.upper(), path, op
+
+
+def main(argv) -> None:
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return
+    cmd, args = argv[0], argv[1:]
+    if cmd == "fetch":
+        fetch()
+        return
+    spec = load()
+    if cmd == "tags":
+        from collections import Counter
+        c = Counter(t for _, _, op in operations(spec) for t in op.get("tags", []))
+        for tag, n in sorted(c.items()):
+            print(f"{n:4}  {tag}")
+    elif cmd == "search":
+        words = [w.lower() for w in args]
+        for method, path, op in operations(spec):
+            hay = " ".join([path, op.get("summary", ""), " ".join(op.get("tags", []))]).lower()
+            if all(w in hay for w in words):
+                print(f"{method:6} {path}   — {op.get('summary', '')}  [{', '.join(op.get('tags', []))}]")
+    elif cmd == "op":
+        method, path = args[0].lower(), args[1]
+        op = spec["paths"].get(path, {}).get(method)
+        if not op:
+            sys.exit(f"no {method.upper()} {path} in spec (try: omada-apidoc search ...)")
+        desc = re.sub(r"\s+", " ", op.get("description") or "")
+        print(f"{method.upper()} {path}")
+        print(f"  {op.get('summary', '')}")
+        print(f"  {desc}")
+        for p in op.get("parameters", []):
+            print(f"  param {p['in']}:{p['name']}{' *' if p.get('required') else ''}  {describe(p.get('schema', {}))} {p.get('description', '')}")
+        body = ((op.get("requestBody") or {}).get("content") or {}).get("application/json", {}).get("schema")
+        if body:
+            print("  body (* = required):")
+            show_schema(spec, ref_name(body), depth=2)
+    elif cmd == "schema":
+        show_schema(spec, args[0], max_depth=int(args[1]) if len(args) > 1 else 2)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
